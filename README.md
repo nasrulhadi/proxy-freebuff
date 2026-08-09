@@ -252,7 +252,7 @@ The backend rejects requests that don't look like the CLI. The proxy sends:
 - **Daily session quota** — free sessions are limited per account per Pacific day; expect `402` once exhausted.
 - **Model-bound sessions** — sessions are pinned to one model; switching models may require ending the session (`model_locked` / `session_model_mismatch`). Auto-switching is not implemented yet.
 - **`count_tokens` is an estimate** — a zero-dependency heuristic (chars/4), not a real tokenizer.
-- **Windows port auto-kill** — on Windows, the proxy kills any process already listening on `FB_PORT` at startup (`netstat`/`taskkill`); on other platforms you may need to free the port manually.
+- **Windows stale-process cleanup** — on Windows, if `FB_PORT` is held by a leftover `node` process, the proxy kills **only that process** at startup (verified via `netstat`/`tasklist`/`taskkill`). Anything else holding the port is left alone; free it manually or change `FB_PORT`.
 
 ## Logs
 

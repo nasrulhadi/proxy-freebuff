@@ -46,6 +46,7 @@ function dumpStream(genId, upstream) {
   if (!DEBUG) return null;
   fs.mkdirSync(dumpDir, { recursive: true });
   const file = fs.createWriteStream(path.join(dumpDir, `dump-${genId}.txt`));
+  file.on('error', (e) => logger.logErr(`${genId} | dump write failed: ${e.message}`));
   upstream.on('data', (c) => file.write(c));
   upstream.on('end', () => file.end());
   upstream.on('error', () => file.end());
@@ -136,18 +137,58 @@ function readBody(req, limit) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
+    let done = false;
+    const fail = (err) => {
+      if (done) return;
+      done = true;
+      reject(err);
+    };
+    const succeed = (buf) => {
+      if (done) return;
+      done = true;
+      resolve(buf);
+    };
     req.on('data', (c) => {
+      if (done) return;
       size += c.length;
       if (size > limit) {
-        req.destroy();
-        reject(new Error('request body too large'));
+        const err = new Error('request body too large');
+        err.status = 413;
+        req.pause();
+        fail(err);
         return;
       }
       chunks.push(c);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
+    req.on('end', () => succeed(Buffer.concat(chunks)));
+    req.on('error', fail);
+    req.on('close', () => {
+      if (done) return;
+      if (req.complete) succeed(Buffer.concat(chunks));
+      else {
+        const err = new Error('request aborted');
+        err.code = 'ABORTED';
+        fail(err);
+      }
+    });
   });
+}
+
+function handleBodyError(req, res, format, e) {
+  if (e && e.status === 413) {
+    if (format === 'claude') writeClaudeError(res, 413, 'request body too large', 'invalid_request_error');
+    else writeOpenAIError(res, 413, 'request body too large', 'invalid_request_error', '');
+    res.on('finish', () => req.destroy());
+    req.resume();
+    return;
+  }
+  if (e && e.code === 'ABORTED') return; // client is gone, nothing to respond to
+  logger.logErr(`internal error: ${e && e.message ? e.message : e}`);
+  try {
+    if (res.headersSent) res.end();
+    else if (format === 'claude') writeClaudeError(res, 500, 'internal server error', 'api_error');
+    else writeOpenAIError(res, 500, 'internal server error', 'server_error', '');
+  } catch {}
 }
 
 function isSessionInvalid(status, body) {
@@ -173,31 +214,56 @@ function isRunInvalid(status, body) {
 }
 
 function pipeThrough(res, upstream, genId, isSSE) {
-  const headers = {};
-  for (const [k, v] of upstream.headers) {
-    if (k.toLowerCase() !== 'content-length') headers[k] = v;
-  }
-  res.writeHead(upstream.statusCode, { ...CORS, ...headers });
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
 
-  upstream.on('data', (c) => res.write(c));
-  upstream.on('end', () => {
-    res.end();
-    logger.logDone(`${genId} | pipe end`);
-  });
-  upstream.on('error', (e) => {
-    logger.logErr(`${genId} | upstream stream error: ${e.message}`);
-    if (!res.headersSent) {
-      writeOpenAIError(res, 502, e.message, 'upstream_error', '');
+    try {
+      const headers = {};
+      for (const [k, v] of upstream.headers) {
+        if (k.toLowerCase() !== 'content-length') headers[k] = v;
+      }
+      res.writeHead(upstream.statusCode, { ...CORS, ...headers });
+    } catch (e) {
+      logger.logErr(`${genId} | pipe failed before start: ${e.message}`);
+      upstream.destroy();
+      done();
       return;
     }
-    if (isSSE) {
-      res.write(`data: ${JSON.stringify({ error: { message: e.message, type: 'upstream_error' } })}\n\n`);
-      res.write('data: [DONE]\n\n');
-    }
-    res.end();
-  });
-  res.on('close', () => {
-    if (!res.writableEnded) upstream.destroy();
+
+    upstream.on('data', (c) => {
+      try {
+        res.write(c);
+      } catch {
+        upstream.destroy();
+      }
+    });
+    upstream.on('end', () => {
+      try {
+        res.end();
+      } catch {}
+      logger.logDone(`${genId} | pipe end`);
+      done();
+    });
+    upstream.on('error', (e) => {
+      logger.logErr(`${genId} | upstream stream error: ${e.message}`);
+      try {
+        if (isSSE) {
+          res.write(`data: ${JSON.stringify({ error: { message: e.message, type: 'upstream_error' } })}\n\n`);
+          res.write('data: [DONE]\n\n');
+        }
+        res.end();
+      } catch {}
+      done();
+    });
+    upstream.on('close', done);
+    res.on('close', () => {
+      if (!res.writableEnded) upstream.destroy();
+    });
   });
 }
 
@@ -213,11 +279,27 @@ async function proxyChat(req, res, payload, model, format, stream) {
   const genId = 'chatcmpl-' + Date.now();
   logger.logReq(`${model} | ${req.socket.remoteAddress || '-'} | ${format} | ${stream ? 'stream' : 'sync'}`);
 
+  const clientGone = { flag: false };
+  const controller = new AbortController();
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      clientGone.flag = true;
+      controller.abort();
+    }
+  });
+  const gone = () => clientGone.flag;
+  const release = (lease) => {
+    pool.release(lease.run);
+    lease.run = null;
+  };
+
   for (let attempt = 0; attempt < 2; attempt++) {
+    if (gone()) return;
     let lease;
     try {
       lease = await pool.acquire(agentID);
     } catch (e) {
+      if (gone()) return;
       if (e instanceof WaitingRoomError) {
         if (e.retryAfter > 0) res.setHeader('Retry-After', String(Math.ceil(e.retryAfter / 1000)));
         logger.logErr(`${model} | ${e.message}`);
@@ -230,12 +312,17 @@ async function proxyChat(req, res, payload, model, format, stream) {
       else writeOpenAIError(res, 502, 'no healthy upstream auth token available', 'server_error', '');
       return;
     }
+    if (gone()) {
+      release(lease);
+      return;
+    }
 
     let sessionInstanceID;
     try {
       sessionInstanceID = await pool.ensureSession();
     } catch (e) {
-      pool.release(lease.run);
+      release(lease);
+      if (gone()) return;
       if (e instanceof WaitingRoomError) {
         if (e.retryAfter > 0) res.setHeader('Retry-After', String(Math.ceil(e.retryAfter / 1000)));
         logger.logErr(`${model} | ${e.message}`);
@@ -248,29 +335,42 @@ async function proxyChat(req, res, payload, model, format, stream) {
       else writeOpenAIError(res, 502, 'failed to acquire upstream free session', 'server_error', '');
       return;
     }
+    if (gone()) {
+      release(lease);
+      return;
+    }
 
     const upstreamBody = injectMetadata(payload, { model, runId: lease.run.id, sessionInstanceID });
 
     let up;
     try {
-      up = await client.chatCompletions(TOKEN, upstreamBody, { model, instanceId: sessionInstanceID });
+      up = await client.chatCompletions(TOKEN, upstreamBody, { model, instanceId: sessionInstanceID, signal: controller.signal });
     } catch (e) {
-      pool.release(lease.run);
+      release(lease);
+      if (gone()) return;
       logger.logErr(`${model} | upstream: ${e.message}`);
       if (format === 'claude') writeClaudeError(res, 502, e.message, 'api_error');
       else writeOpenAIError(res, 502, e.message, 'server_error', '');
+      return;
+    }
+    if (gone()) {
+      release(lease);
       return;
     }
 
     logger.logUp(`${up.statusCode} ${up.statusCode >= 200 && up.statusCode < 300 ? 'OK' : 'ERR'} | ${model} | ${Date.now() - t0}ms | run ${lease.run.id}`);
 
     if (up.statusCode >= 200 && up.statusCode < 300) {
-      dumpStream(genId, up);
+      try {
+        dumpStream(genId, up);
+      } catch (e) {
+        logger.logErr(`${model} | dump failed: ${e.message}`);
+      }
       try {
         if (format === 'claude') {
           await pipeClaude(res, up, model, stream, genId);
         } else {
-          pipeThrough(res, up, genId, stream);
+          await pipeThrough(res, up, genId, stream);
         }
       } catch (e) {
         logger.logErr(`${model} | response pipe failed: ${e.message}`);
@@ -281,7 +381,7 @@ async function proxyChat(req, res, payload, model, format, stream) {
           res.end();
         }
       }
-      pool.release(lease.run);
+      release(lease);
       logger.logDone(`${model} | ${Date.now() - t0}ms`);
       return;
     }
@@ -291,13 +391,13 @@ async function proxyChat(req, res, payload, model, format, stream) {
     if (isSessionInvalid(up.statusCode, errorBody)) {
       logger.logErr(`${model} | session invalid, refreshing and retrying: ${errorBody}`);
       pool.invalidateSession(String(errorBody).trim());
-      pool.release(lease.run);
+      release(lease);
       continue;
     }
     if (isRunInvalid(up.statusCode, errorBody)) {
       logger.logErr(`${model} | run invalid, rotating and retrying: ${errorBody}`);
       pool.invalidate(agentID, String(errorBody).trim());
-      pool.release(lease.run);
+      release(lease);
       continue;
     }
     if (up.statusCode === 401) {
@@ -305,37 +405,70 @@ async function proxyChat(req, res, payload, model, format, stream) {
       pool.invalidateSession('upstream auth rejected token');
     }
 
-    pool.release(lease.run);
+    release(lease);
+    if (gone()) return;
     logger.logErr(`${model} | upstream ${up.statusCode}: ${errorBody}`);
     writeUpstreamError(format, res, up.statusCode, errorBody);
     return;
   }
 
+  if (gone()) return;
   logger.logErr(`${model} | upstream run expired twice in a row`);
   if (format === 'claude') writeClaudeError(res, 502, 'upstream run expired twice in a row', 'api_error');
   else writeOpenAIError(res, 502, 'upstream run expired twice in a row', 'server_error', '');
 }
 
 function pipeClaude(res, upstream, model, stream, genId) {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (fn) => (...args) => {
+      if (settled) return;
+      settled = true;
+      fn(...args);
+    };
+
+    upstream.on('close', settle(() => resolve()));
+    res.on('close', () => {
+      if (!res.writableEnded) upstream.destroy();
+    });
+
     if (!stream) {
       readBody(upstream, 64 * 1024 * 1024)
-        .then((body) => {
-          if (upstream.statusCode >= 400) {
-            writeUpstreamError('claude', res, upstream.statusCode, body);
+        .then(settle((body) => {
+          try {
+            if (upstream.statusCode >= 400) {
+              writeUpstreamError('claude', res, upstream.statusCode, body);
+              resolve();
+              return;
+            }
+            const converted = convertOpenAIResponseToClaude(body.toString());
+            res.writeHead(200, { ...CORS, 'Content-Type': 'application/json' });
+            res.end(converted);
             resolve();
-            return;
+          } catch (e) {
+            logger.logErr(`${genId} | claude convert failed: ${e.message}`);
+            try {
+              if (!res.headersSent) writeClaudeError(res, 502, e.message, 'api_error');
+            } catch {}
+            resolve();
           }
-          const converted = convertOpenAIResponseToClaude(body.toString());
-          res.writeHead(200, { ...CORS, 'Content-Type': 'application/json' });
-          res.end(converted);
+        }))
+        .catch(settle((e) => {
+          try {
+            if (!res.headersSent) writeClaudeError(res, 502, e.message, 'api_error');
+          } catch {}
           resolve();
-        })
-        .catch(reject);
+        }));
       return;
     }
 
-    res.writeHead(200, { ...CORS, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
+    try {
+      res.writeHead(200, { ...CORS, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
+    } catch (e) {
+      upstream.destroy();
+      resolve();
+      return;
+    }
 
     const converter = createClaudeStreamConverter(model);
     let buffer = '';
@@ -370,7 +503,7 @@ function pipeClaude(res, upstream, model, stream, genId) {
       }
     });
 
-    upstream.on('end', () => {
+    upstream.on('end', settle(() => {
       if (buffer.trim().startsWith('data:')) {
         const payload = buffer.slice(5).trim();
         if (payload) pendingData = pendingData ? pendingData + '\n' + payload : payload;
@@ -385,23 +518,21 @@ function pipeClaude(res, upstream, model, stream, genId) {
       }
       res.end();
       resolve();
-    });
+    }));
 
-    upstream.on('error', (e) => {
+    upstream.on('error', settle((e) => {
       logger.logErr(`${genId} | claude upstream stream error: ${e.message}`);
-      if (!res.headersSent) {
-        writeClaudeError(res, 502, e.message, 'api_error');
-      } else {
-        const events = converter.finish();
-        for (const evt of events) res.write(`event: ${evt.name}\ndata: ${JSON.stringify(evt.payload)}\n\n`);
-        res.end();
-      }
+      try {
+        if (!res.headersSent) {
+          writeClaudeError(res, 502, e.message, 'api_error');
+        } else {
+          const events = converter.finish();
+          for (const evt of events) res.write(`event: ${evt.name}\ndata: ${JSON.stringify(evt.payload)}\n\n`);
+          res.end();
+        }
+      } catch {}
       resolve();
-    });
-
-    res.on('close', () => {
-      if (!res.writableEnded) upstream.destroy();
-    });
+    }));
   });
 }
 
@@ -466,10 +597,16 @@ function handleRequest(req, res) {
           writeClaudeError(res, 400, `unsupported model "${model}"`, 'invalid_request_error');
           return;
         }
-        const { payload } = convertClaudeToOpenAI(parsed);
-        writeJSON(res, 200, { input_tokens: countOpenAIPayloadTokens(payload) });
+        let converted;
+        try {
+          converted = convertClaudeToOpenAI(parsed);
+        } catch (e) {
+          writeClaudeError(res, 400, e.message, 'invalid_request_error');
+          return;
+        }
+        writeJSON(res, 200, { input_tokens: countOpenAIPayloadTokens(converted.payload) });
       })
-      .catch(() => writeClaudeError(res, 400, 'request body too large', 'invalid_request_error'));
+      .catch((e) => handleBodyError(req, res, 'claude', e));
     return;
   }
 
@@ -494,7 +631,7 @@ function handleRequest(req, res) {
         }
         return proxyChat(req, res, parsed, model, 'openai', parsed.stream === true);
       })
-      .catch(() => writeOpenAIError(res, 400, 'request body too large', 'invalid_request_error', ''));
+      .catch((e) => handleBodyError(req, res, 'openai', e));
     return;
   }
 
@@ -521,22 +658,46 @@ function handleRequest(req, res) {
         }
         return proxyChat(req, res, converted.payload, converted.model, 'claude', converted.stream);
       })
-      .catch(() => writeClaudeError(res, 400, 'request body too large', 'invalid_request_error'));
+      .catch((e) => handleBodyError(req, res, 'claude', e));
     return;
   }
 
   writeOpenAIError(res, 404, 'not found', 'invalid_request_error', '');
 }
 
-try {
-  const netstat = execSync(`netstat -ano | findstr :${PORT} | findstr LISTENING`, { encoding: 'utf8', timeout: 5000 });
-  const match = netstat.trim().match(/(\d+)\s*$/m);
-  if (match) {
-    const pid = match[1];
-    logger.log(`killing existing process on port ${PORT} (PID ${pid})`);
-    execSync(`taskkill /F /PID ${pid}`, { timeout: 5000 });
+if (process.platform === 'win32') {
+  try {
+    const netstat = execSync('netstat -ano', { encoding: 'utf8', timeout: 5000 });
+    const re = new RegExp(`^\\s*TCP\\s+\\S+:${PORT}\\s+\\S+\\s+LISTENING\\s+(\\d+)\\s*$`, 'gim');
+    const pids = new Set();
+    for (const m of netstat.matchAll(re)) pids.add(m[1]);
+    for (const pid of pids) {
+      try {
+        const tasklist = execSync(`tasklist /FI "PID eq ${pid}" /FO CSV /NH`, { encoding: 'utf8', timeout: 5000 });
+        let isNode = false;
+        for (const line of tasklist.split(/\r?\n/)) {
+          const cols = line.trim().replace(/^"|"$/g, '').split('","');
+          if (cols[0] && /node/i.test(cols[0]) && cols[1] === pid) {
+            isNode = true;
+            break;
+          }
+        }
+        if (isNode) {
+          logger.log(`port ${PORT} is held by a previous node process (PID ${pid}) - killing it`);
+          execSync(`taskkill /F /PID ${pid}`, { timeout: 5000 });
+        } else {
+          logger.logErr(`port ${PORT} is in use by non-node process PID ${pid} - NOT killing it (free the port or change FB_PORT)`);
+        }
+      } catch (e) {
+        logger.logErr(`port ${PORT}: could not inspect PID ${pid} (${e.message}) - not killing it`);
+      }
+    }
+  } catch (e) {
+    logger.logErr(`port check failed (${e.message}) - will rely on EADDRINUSE handling`);
   }
-} catch {}
+} else {
+  logger.log(`not on Windows - skipping auto-kill of stale processes on port ${PORT}`);
+}
 
 const server = http.createServer(handleRequest);
 server.timeout = REQUEST_TIMEOUT;
