@@ -4,16 +4,16 @@ A transparent, zero-dependency **OpenAI- and Anthropic-compatible proxy** for [F
 
 Freebuff is only officially usable through its own CLI. This proxy speaks the same wire protocol the CLI uses, manages the free-session and agent-run lifecycle for you, and exposes a clean OpenAI/Anthropic API on your local machine.
 
-```
-Your tool → POST /v1/chat/completions (OpenAI)  ─┐
-          → POST /v1/messages (Anthropic)        ├─ Proxy Freebuff
-                                                  ┘
-        ├─ free session lifecycle  (create / poll / end)
-        ├─ agent run lifecycle     (START / reuse / rotate / FINISH)
-        └─ chat request            (POST /api/v1/chat/completions)
-                                                        │
-                                                        ▼
-                                              api.codebuff.com
+```mermaid
+flowchart LR
+    T[Your tool] -->|POST /v1/chat/completions - OpenAI| P[Proxy Freebuff]
+    T -->|POST /v1/messages - Anthropic| P
+    P --> S[Free session<br/>create / poll / end]
+    P --> R[Agent run<br/>START / rotate / FINISH]
+    P --> C[POST /api/v1/chat/completions]
+    S --> U[api.codebuff.com]
+    R --> U
+    C --> U
 ```
 
 ## Why
@@ -73,18 +73,13 @@ $env:FB_TOKEN="user_xxxxxxxxxx"; node server.js
 FB_TOKEN=user_xxxxxxxxxx node server.js
 ```
 
-```
-┌─────────────────────────────────────────────────┐
-│  Proxy Freebuff                                  │
-│  OpenAI/Anthropic → codebuff.com free agents     │
-├─────────────────────────────────────────────────┤
-│  Listening    http://127.0.0.1:3457              │
-│  OpenAI       POST /v1/chat/completions          │
-│  Anthropic    POST /v1/messages, /v1/messages/count_tokens │
-│  Upstream     https://codebuff.com               │
-│  Proxy        none                               │
-│  Token        configured                         │
-└─────────────────────────────────────────────────┘
+```text
+Proxy Freebuff
+  OpenAI       POST /v1/chat/completions
+  Anthropic    POST /v1/messages, /v1/messages/count_tokens
+  Upstream     https://codebuff.com
+  Listening    http://127.0.0.1:3457
+  Token        configured
 ```
 
 Smoke test:
