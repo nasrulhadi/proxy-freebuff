@@ -1,0 +1,11 @@
+{
+  "name": "proxy-freebuff",
+  "version": "1.0.0",
+  "description": "Proxy: OpenAI/Anthropic API → Freebuff (codebuff.com free agents)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {}
+}
