@@ -31,13 +31,14 @@ Calling `/api/v1/chat/completions` directly gets you rejected with `403 free_mod
 
 - **OpenAI-compatible** — `POST /v1/chat/completions` (streaming + non-streaming), `GET /v1/models`
 - **Anthropic-compatible** — `POST /v1/messages` (streaming + non-streaming), `POST /v1/messages/count_tokens` with automatic format conversion (thinking blocks, tool use, images)
-- **Free session management** — creates, polls, and rotates free sessions; surfaces the waiting room as `503 + Retry-After` so clients retry politely
+- **Free session management** — creates (only when the CLI is not running), polls, and rotates free sessions; surfaces the waiting room as `503 + Retry-After` so clients retry politely
 - **Agent run lifecycle** — one run per agent, pre-warmed lazily, rotated every 6h, `FINISH`ed on rotation/shutdown so runs never dangle
 - **Error recovery** — transparent refresh on `session_expired`/`session_superseded`/`waiting_room_*`, run rotation on `runId not found`, cooldown on auth rejection
 - **Live model registry** — parses the current agent→model mapping straight from the upstream `CodebuffAI/codebuff` TypeScript sources (with a hardcoded fallback); refreshes every 6h
 - **Tool schema normalization** — resolves `$ref`/`$defs` and simplifies nullable `anyOf`/`oneOf`/array types before forwarding
 - **Outbound proxy support** — `FB_PROXY` (HTTP CONNECT or SOCKS5) for routing through a clean residential IP
 - **Observability** — colorized terminal logs + `proxy.log`, optional debug dumps to `dump/`
+- **CLI identity reuse** — `--credentials` uses the Freebuff CLI's own token and adopts its active session (via `~/.config/manicode/freebuff-instance-owner.json`) so the proxy and CLI share the account's single free session instead of fighting over it. **While the CLI process is running the proxy never creates or deletes a session**: it only adopts/refreshes the CLI's instance (re-reading the owner file on every refresh so a CLI restart is picked up) and refuses with a clear message if the session can't be verified — so running the proxy can never log the CLI out. Stop the CLI first if you need a different model
 - **Zero dependencies** — Node.js 18+ only
 
 ## Getting a token
@@ -56,7 +57,12 @@ Freebuff requires a `user_...` auth token. Two ways to get one:
    | Windows | `C:\Users\<you>\.config\manicode\credentials.json` |
    | Linux / macOS | `~/.config/manicode/credentials.json` |
 
-   The file contains a `default.authToken` value — that's your token.
+   The file contains a `default.authToken` value — that's your token (a UUID, not a `user_…` string).
+
+   **Easiest: just pass `--credentials`** — the proxy reads the CLI's own `credentials.json` (token + account id) and even adopts the CLI's active free session, so it never competes with the CLI for your single session slot:
+   ```bash
+   node server.js --credentials
+   ```
 
 2. **Web** — log in at [https://freebuff.llm.pm](https://freebuff.llm.pm) and copy the displayed token.
 
@@ -71,6 +77,9 @@ $env:FB_TOKEN="user_xxxxxxxxxx"; node server.js
 
 # Linux / macOS
 FB_TOKEN=user_xxxxxxxxxx node server.js
+
+# or pass config as CLI flags (they override env vars)
+node server.js --token=user_xxxxxxxxxx --port=3457
 ```
 
 ```text
@@ -91,7 +100,7 @@ curl http://127.0.0.1:3457/v1/models
 
 ## Configuration
 
-All configuration is via environment variables.
+All configuration is via environment variables, and every variable can also be passed as a CLI flag (`--token=...`, `--port=...`, `--debug`, …) — run `node server.js --help` for the full list. CLI args take precedence over env vars.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -103,8 +112,13 @@ All configuration is via environment variables.
 | `FB_ROTATION` | `21600000` | Agent run rotation interval in ms (6 h) |
 | `FB_PROXY` | — | Outbound proxy: `http://host:port`, `http://user:pass@host:port`, `socks5://host:port`, `socks5://user:pass@host:port` |
 | `FB_API_KEYS` | — | Comma-separated keys required from proxy clients (`x-api-key` or `Bearer`). Empty = open on localhost |
-| `FB_DEBUG` | — | Set `1` to dump raw upstream responses to `dump/` |
+| `FB_DEBUG` | — | Set `1` to dump raw upstream responses **and the exact outbound request** (headers minus `Authorization`, truncated body) to `dump/req-*.json` — use this to verify the wire shape |
 | `FB_AGENTS_URL` | — | Override the base URL used to fetch the model registry sources |
+| `FB_CREDENTIALS` | — | Set `1` (or pass `--credentials`) to use the Freebuff CLI identity from `~/.config/manicode/credentials.json` and adopt its active session |
+| `FB_USER_AGENT` | `ai-sdk/openai-compatible/0.10.7/codebuff` | Pin a single outbound `User-Agent`. The default is the exact UA the CLI SDK pins (`model-provider.ts`) — the free-mode gate expects it (`403 free_mode_cli_required` otherwise) |
+| `FB_USER_ID` | — | Freebuff account id (auto-filled from the CLI credentials with `--credentials`; sent on every chat call as `x-freebuff-acting-user-id` — the real CLI sends it and the gate expects it) |
+| `FB_HTTP2` | `1` | Upstream transport. The real CLI runs on **Bun**, whose `fetch` negotiates **HTTP/2** with the server — and the known-working reference (trefeon on 9router/Cloudflare Workers) also speaks HTTP/2. Node's `https` module is HTTP/1.1, which the free-mode gate treats as a direct API caller. Default `1` = try HTTP/2 first and fall back to HTTP/1.1 automatically if the server can't ALPN it; set `0` to force HTTP/1.1 |
+| `FB_COST_MODE` | `free` | Billing mode sent as `codebuff_metadata.cost_mode`. `free` = **0 credits** on free-allowlisted agent+model combos (what the CLI's LITE mode sends). Use `normal`/`lite`/`max` if you buy credits |
 
 ## API
 
@@ -231,11 +245,14 @@ POST /api/v1/agent-runs  {action:"FINISH", runId, status:"completed", totalSteps
 
 ### CLI-compatible request envelope
 
-The backend rejects requests that don't look like the CLI. The proxy sends:
+The backend rejects requests that don't look like the CLI (`403 free_mode_cli_required`). The proxy replicates the CLI's wire identity exactly (verified against the public `CodebuffAI/codebuff` source):
 
-- **No `cost_mode` field** in `codebuff_metadata` — presence of `cost_mode` is what trips `free_mode_cli_required`
-- `x-freebuff-model` and `x-freebuff-instance-id` headers
-- `codebuff_metadata` with `run_id`, `client_id`, `freebuff_instance_id`
+- **Chat requests** carry exactly what the real CLI sends: the pinned `ai-sdk/openai-compatible/0.10.7/codebuff` `User-Agent` and `x-freebuff-acting-user-id` (the account id). No `x-freebuff-model` / `x-freebuff-instance-id` headers on the chat call — the session instance travels in the body's `codebuff_metadata.freebuff_instance_id` instead
+- **Session calls** send `x-freebuff-model` (POST) and `x-freebuff-instance-id` (GET), exactly like the CLI
+- **Body envelope** — `provider: { allow_fallbacks: true }` (the CLI's routing options for non-allowlisted models: `{ order: providerOrder[model], allow_fallbacks: !isExplicitlyDefined }` from `sdk/src/impl/llm.ts`, with `order` absent for models outside the statically defined set). No `stop` list on plain chat — the CLI wires none (the `cb_easp` sentinel is an internal agent step param, not a model stop sequence), and caller-supplied stops pass through untouched
+- **`stream: true` is always forced upstream** — the CLI never sends sync chat, and the free-mode gate rejects sync chat calls as "calling the API directly". The proxy forces `stream: true` on every upstream request and **accumulates the SSE back into a JSON completion for sync clients** (OpenAI and Anthropic alike), so client behavior is unchanged
+- `codebuff_metadata` with `run_id`, `client_id` (a fresh 13-char base36 id per request, the shape the CLI mints via `Math.random().toString(36).substring(2, 15)` — the gate validates this format), `trace_session_id` (a UUID, sent by the CLI on every request), `cost_mode`, `freebuff_instance_id`
+- `cost_mode: 'free'` in `codebuff_metadata` — this is the CLI's billing switch. Free mode gets **0 credits** on allowlisted agent+model combos (see `FREE_MODE_AGENT_MODELS` in the upstream `free-agents.ts`); without it the server bills the account as paid and a credit-less account gets `402 Out of credits` (the CLI SDK defaults to `normal` when absent). Override with `FB_COST_MODE` if you pay for credits
 
 ### Error recovery matrix
 
@@ -279,11 +296,12 @@ Set `FB_DEBUG=1` to dump raw upstream responses to `dump/` for troubleshooting.
 |---|---|
 | `[error] FB_TOKEN is not set` | Set `FB_TOKEN` and restart |
 | `401 upstream` | Token invalid — get a fresh one (see [Getting a token](#getting-a-token)) |
-| `403 free_mode_cli_required` | The request carried `cost_mode` — check you're running the latest version of this repo |
-| `402 Out of credits` | Blocked country (entitlement 0) **or** daily quota exhausted — check `GET /healthz` for session/rate details, and route through a clean IP |
+| `403 free_mode_cli_required` | The request didn't carry the CLI envelope — make sure you're running the latest version of this repo (pinned `ai-sdk/openai-compatible/0.10.7/codebuff` UA, `x-freebuff-acting-user-id` header, `provider: { allow_fallbacks: true }` (no `data_collection`), no `stop` list on plain chat, 13-char base36 `client_id`, `trace_session_id`, `cost_mode: free`, **forced `stream: true`**, no `x-freebuff-*` headers on chat, and **HTTP/2 upstream** (the CLI runs on Bun and speaks HTTP/2 — the proxy uses it by default with HTTP/1.1 fallback). If it persists, capture `dump/req-*.json` (`FB_DEBUG=1`) and compare against the envelope above |
+| `402 Out of credits` | The proxy now sends `cost_mode: 'free'` by default; with an allowlisted model + adopted session this should clear. If you still see 402, it's the country/quota gate (entitlement 0 or daily quota exhausted) — check `GET /healthz` and route through a clean IP |
 | `403 country_blocked / anonymous_network` | Upstream IP is a VPN/datacenter — see [Running through a clean IP](#running-through-a-clean-ip-important) |
 | `503 waiting room queued` | Upstream queue — client should retry after `Retry-After` |
 | `EADDRINUSE` | Port busy (Windows auto-kills the stale process; elsewhere free it manually) |
+| CLI gets logged out when the proxy runs | Older proxy versions created a competing session while the CLI was alive (or DELETEd the adopted session on shutdown), which the server treats as session supersession → CLI logout. The current proxy never creates/deletes a session while the CLI runs — update and restart the proxy |
 
 ## Disclaimer
 

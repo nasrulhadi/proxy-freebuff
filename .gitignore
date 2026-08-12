@@ -2,3 +2,9 @@ proxy.log
 dump/
 dump-*.txt
 node_modules/
+
+# debug artifacts from the free_mode_cli_required investigation
+cli-capture.jsonl
+_cap_out.txt
+_nodeprobe_out.txt
+_nodeprobe.js

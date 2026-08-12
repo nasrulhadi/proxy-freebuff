@@ -3,6 +3,7 @@
 const http = require('http');
 const https = require('https');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { execSync } = require('child_process');
 
@@ -13,6 +14,7 @@ const { WaitingRoomError } = require('./lib/sessions');
 const { ModelRegistry, DEFAULT_SOURCE_URL } = require('./lib/registry');
 const {
   injectMetadata,
+  accumulateOpenAIStream,
   convertClaudeToOpenAI,
   convertOpenAIResponseToClaude,
   createClaudeStreamConverter,
@@ -23,9 +25,118 @@ const {
   normalizeClaudeErrorType,
 } = require('./lib/convert');
 
+const CLI_USAGE = [
+  'Usage: node server.js [options]',
+  '',
+  'Options map onto the FB_* environment variables (CLI args take precedence):',
+  '  --token=<token>      FB_TOKEN       Freebuff auth token (user_...)',
+  '  --port=<port>        FB_PORT        Listen port (default 3457)',
+  '  --host=<host>        FB_HOST        Listen host (default 127.0.0.1)',
+  '  --upstream=<url>     FB_UPSTREAM    Upstream base URL (default https://codebuff.com)',
+  '  --timeout=<ms>       FB_TIMEOUT     Upstream request timeout (default 900000)',
+  '  --rotation=<ms>      FB_ROTATION    Agent run rotation interval (default 21600000)',
+  '  --cost-mode=<mode>   FB_COST_MODE   Billing mode sent upstream (default free - 0 credits on free-allowlisted models; use normal/lite/max for paid)',  '  --user-id=<id>       FB_USER_ID       Freebuff account id (auto-filled from --credentials; sent as x-freebuff-acting-user-id)',
+  '  --http2=<0|1>        FB_HTTP2         Use HTTP/2 upstream (default 1 - the CLI runs on Bun and speaks HTTP/2; falls back to HTTP/1.1 automatically)',
+  '  --proxy=<url>        FB_PROXY       Outbound proxy: http://host:port or socks5://host:port',
+  '  --api-keys=<k1,k2>   FB_API_KEYS    Comma-separated client API keys (empty = open on localhost)',
+  '  --agents-url=<url>   FB_AGENTS_URL  Model registry source override',
+  '  --debug              FB_DEBUG=1     Dump raw upstream responses to dump/',
+  '  --credentials        FB_CREDENTIALS=1 Use the Freebuff CLI identity from ~/.config/manicode/credentials.json',
+  '                                     (token + adopt the CLI\'s active session - respects the single-session limit)',
+  '  --help                                 Show this help',
+];
+const CLI_KEYS = ['token', 'port', 'host', 'upstream', 'timeout', 'rotation', 'cost-mode', 'user-id', 'proxy', 'api-keys', 'agents-url', 'debug', 'credentials', 'http2'];
+
+function applyCliArgs(argv) {
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--help' || arg === '-h') {
+      console.log(CLI_USAGE.join('\n'));
+      process.exit(0);
+    }
+    if (!arg.startsWith('--')) continue;
+    const eq = arg.indexOf('=');
+    const name = eq !== -1 ? arg.slice(2, eq) : arg.slice(2);
+    if (!name) continue;
+    if (name === 'help') {
+      console.log(CLI_USAGE.join('\n'));
+      process.exit(0);
+    }
+    if (!CLI_KEYS.includes(name)) {
+      console.warn(`ignoring unknown option --${name}`);
+      continue;
+    }
+    let value;
+    if (eq !== -1) {
+      value = arg.slice(eq + 1);
+    } else {
+      const next = argv[i + 1];
+      if (next !== undefined && !next.startsWith('-')) {
+        value = next;
+        i++;
+      } else if (name === 'debug' || name === 'credentials') {
+        value = '1'; // bare flag
+      } else {
+        console.warn(`missing value for --${name} (use --${name}=<value>); ignoring`);
+        continue;
+      }
+    }
+    process.env['FB_' + name.toUpperCase().replace(/-/g, '_')] = value;
+  }
+}
+applyCliArgs(process.argv.slice(2));
+
+// Freebuff CLI identity: the CLI stores its credentials (token + hardware
+// fingerprint) and its active session instance in ~/.config/manicode. The
+// proxy can reuse both so it behaves like the CLI and never competes for the
+// account's single free session.
+const CLI_CONFIG_DIR = path.join(os.homedir(), '.config', 'manicode');
+
+function readCliCredentials() {
+  try {
+    const creds = JSON.parse(fs.readFileSync(path.join(CLI_CONFIG_DIR, 'credentials.json'), 'utf8'));
+    const user = (creds && creds.default) || {};
+    return {
+      token: (user.authToken || '').trim(),
+      id: user.id || '',
+    };
+  } catch {
+    return null;
+  }
+}
+
+function readCliInstanceOwner() {
+  try {
+    const owner = JSON.parse(fs.readFileSync(path.join(CLI_CONFIG_DIR, 'freebuff-instance-owner.json'), 'utf8'));
+    if (typeof owner.instanceId === 'string' && owner.instanceId) {
+      return { instanceId: owner.instanceId, pid: typeof owner.pid === 'number' ? owner.pid : null };
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+const WANT_CLI_CREDENTIALS = process.env.FB_CREDENTIALS === '1';
+let TOKEN = (process.env.FB_TOKEN || '').trim();
+let CLI_OWNER = null;
+let CLI_CRED_SOURCE = null;
+if (WANT_CLI_CREDENTIALS || !TOKEN) {
+  const creds = readCliCredentials();
+  if (creds && creds.token) {
+    CLI_CRED_SOURCE = creds;
+    TOKEN = creds.token;
+    CLI_OWNER = readCliInstanceOwner();
+  }
+}
+
+// Freebuff account id from the CLI credentials (--credentials) or FB_USER_ID.
+// Sent on every chat call as x-freebuff-acting-user-id - the real CLI sends it
+// (model-provider.ts) and the free-mode gate expects it.
+const USER_ID = (process.env.FB_USER_ID || '').trim() || (CLI_CRED_SOURCE ? CLI_CRED_SOURCE.id : '');
+
 const PORT = parseInt(process.env.FB_PORT || '3457', 10);
 const HOST = process.env.FB_HOST || '127.0.0.1';
-const TOKEN = (process.env.FB_TOKEN || '').trim();
 const UPSTREAM_BASE = process.env.FB_UPSTREAM || 'https://codebuff.com';
 const REQUEST_TIMEOUT = parseInt(process.env.FB_TIMEOUT || String(15 * 60 * 1000), 10);
 const ROTATION_MS = parseInt(process.env.FB_ROTATION || String(6 * 60 * 60 * 1000), 10);
@@ -34,12 +145,26 @@ const API_KEYS = (process.env.FB_API_KEYS || '')
   .map((s) => s.trim())
   .filter(Boolean);
 const DEBUG = process.env.FB_DEBUG === '1';
+// HTTP/2 upstream transport (default on): the real CLI runs on Bun, whose
+// fetch negotiates HTTP/2 with the server - and the reference that works
+// (trefeon on 9router/Cloudflare Workers) also speaks HTTP/2. Node's https
+// module speaks HTTP/1.1, the only transport variable never tested against
+// the live gate. Set FB_HTTP2=0 to force HTTP/1.1.
+const USE_HTTP2 = (process.env.FB_HTTP2 || '1') !== '0';
+// Billing modes the upstream accepts (see create-run-config.ts costMode union);
+// unknown values fall back to 'free' and are flagged on startup.
+const COST_MODES = new Set(['free', 'lite', 'normal', 'max', 'experimental', 'ask']);
+const RAW_COST_MODE = (process.env.FB_COST_MODE || 'free').trim().toLowerCase();
+let COST_MODE = COST_MODES.has(RAW_COST_MODE) ? RAW_COST_MODE : 'free';
 const PROXY = parseProxy(process.env.FB_PROXY || '');
 const REGISTRY_REFRESH_MS = 6 * 60 * 60 * 1000;
 const MAINTAIN_MS = 60 * 1000;
 const MAX_BODY = 64 * 1024 * 1024;
 
 const logger = createLogger(path.join(__dirname, 'proxy.log'));
+if (RAW_COST_MODE !== COST_MODE) {
+  logger.logErr(`FB_COST_MODE "${RAW_COST_MODE}" is invalid - using "free" (valid: free, lite, normal, max, experimental, ask)`);
+}
 const dumpDir = path.join(__dirname, 'dump');
 
 function dumpStream(genId, upstream) {
@@ -59,11 +184,29 @@ logger.banner([
   `${C.bold}Anthropic${C.reset}    POST /v1/messages, /v1/messages/count_tokens`,
   `${C.bold}Upstream${C.reset}     ${UPSTREAM_BASE}`,
   `${C.bold}Proxy${C.reset}        ${PROXY ? `${C.green}${PROXY.type}://${PROXY.host}:${PROXY.port}${C.reset}` : `${C.yellow}none${C.reset}`}`,
+  `${C.bold}Transport${C.reset}    ${USE_HTTP2 ? `${C.green}HTTP/2${C.reset} (fallback HTTP/1.1)` : `${C.yellow}HTTP/1.1${C.reset}`}`,
   `${C.bold}Token${C.reset}        ${TOKEN ? `${C.green}configured${C.reset}` : `${C.yellow}MISSING${C.reset}`}`,
   `${C.bold}Timeout${C.reset}      ${REQUEST_TIMEOUT}ms`,
   `${C.bold}Debug${C.reset}        ${DEBUG ? `${C.green}ON${C.reset}` : `${C.yellow}OFF${C.reset}`}`,
+  `${C.bold}CostMode${C.reset}     ${COST_MODE}`,
+  `${C.bold}UserId${C.reset}       ${USER_ID ? `${C.green}configured${C.reset}` : `${C.yellow}-${C.reset}`}`,
 ]);
 logger.log(`=== proxy started (debug: ${DEBUG ? 'ON' : 'OFF'}) ===`);
+
+if (CLI_CRED_SOURCE) {
+  logger.log(`using Freebuff CLI credentials from ${CLI_CONFIG_DIR} (account ${CLI_CRED_SOURCE.id})`);
+  if (CLI_OWNER && CLI_OWNER.instanceId) {
+    logger.log(`will adopt the CLI session instance ${CLI_OWNER.instanceId} (single-session friendly)`);
+  } else {
+    // Credentials found but no instance owner file yet (CLI never ran, or
+    // its session file is missing). Without an instance to adopt we can't
+    // tell whether the CLI is running - warn instead of silently creating a
+    // competing session that could log a live CLI out.
+    logger.logErr('no freebuff-instance-owner.json found - the CLI must run at least once; if the CLI is running, stop it or restart it and retry');
+  }
+} else if (WANT_CLI_CREDENTIALS) {
+  logger.logErr(`--credentials requested but no CLI credentials found at ${CLI_CONFIG_DIR}; falling back to FB_TOKEN`);
+}
 
 if (!TOKEN) {
   logger.logErr('FB_TOKEN is not set - chat requests will fail until you set it');
@@ -72,8 +215,19 @@ if (!TOKEN) {
 const agent = PROXY
   ? createTunnelAgent(PROXY)
   : new https.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 10, timeout: REQUEST_TIMEOUT });
-const client = new UpstreamClient({ baseURL: UPSTREAM_BASE, timeoutMs: REQUEST_TIMEOUT, agent });
-const pool = new RunManager({ name: 'token-1', token: TOKEN, client, logger, rotationMs: ROTATION_MS });
+const client = new UpstreamClient({ baseURL: UPSTREAM_BASE, timeoutMs: REQUEST_TIMEOUT, agent, userId: USER_ID, proxy: PROXY, useHttp2: USE_HTTP2 });
+const pool = new RunManager({
+  name: 'token-1',
+  token: TOKEN,
+  client,
+  logger,
+  rotationMs: ROTATION_MS,
+  initialInstanceId: CLI_OWNER ? CLI_OWNER.instanceId : null,
+  cliOwnerPid: CLI_OWNER ? CLI_OWNER.pid : null,
+  // Re-read the CLI owner file on every session refresh so a CLI restart
+  // (new pid + instance) is adopted instead of a stale startup snapshot.
+  ownerReader: CLI_CRED_SOURCE ? readCliInstanceOwner : null,
+});
 const registry = new ModelRegistry({ logger, sourceUrl: process.env.FB_AGENTS_URL || DEFAULT_SOURCE_URL });
 
 const CORS = {
@@ -213,6 +367,32 @@ function isRunInvalid(status, body) {
   return message.includes('runid not found') || message.includes('runid not running');
 }
 
+// Sync OpenAI clients get the accumulated JSON completion (the upstream is
+// always asked to stream - the CLI never sends sync chat - so the SSE is
+// rebuilt into a chat.completion response here).
+function pipeOpenAISync(res, upstream, genId) {
+  return new Promise((resolve) => {
+    accumulateOpenAIStream(upstream)
+      .then((json) => {
+        if (res.headersSent) {
+          res.end();
+          resolve();
+          return;
+        }
+        res.writeHead(200, { ...CORS, 'Content-Type': 'application/json' });
+        res.end(json);
+        resolve();
+      })
+      .catch((e) => {
+        logger.logErr(`${genId} | sync accumulate failed: ${e.message}`);
+        try {
+          if (!res.headersSent) writeOpenAIError(res, 502, e.message, 'server_error', '');
+        } catch {}
+        resolve();
+      });
+  });
+}
+
 function pipeThrough(res, upstream, genId, isSSE) {
   return new Promise((resolve) => {
     let settled = false;
@@ -224,7 +404,7 @@ function pipeThrough(res, upstream, genId, isSSE) {
 
     try {
       const headers = {};
-      for (const [k, v] of upstream.headers) {
+      for (const [k, v] of Object.entries(upstream.headers || {})) {
         if (k.toLowerCase() !== 'content-length') headers[k] = v;
       }
       res.writeHead(upstream.statusCode, { ...CORS, ...headers });
@@ -297,7 +477,7 @@ async function proxyChat(req, res, payload, model, format, stream) {
     if (gone()) return;
     let lease;
     try {
-      lease = await pool.acquire(agentID);
+      lease = await pool.acquire(agentID, model);
     } catch (e) {
       if (gone()) return;
       if (e instanceof WaitingRoomError) {
@@ -319,7 +499,7 @@ async function proxyChat(req, res, payload, model, format, stream) {
 
     let sessionInstanceID;
     try {
-      sessionInstanceID = await pool.ensureSession();
+      sessionInstanceID = await pool.ensureSession(model);
     } catch (e) {
       release(lease);
       if (gone()) return;
@@ -340,11 +520,16 @@ async function proxyChat(req, res, payload, model, format, stream) {
       return;
     }
 
-    const upstreamBody = injectMetadata(payload, { model, runId: lease.run.id, sessionInstanceID });
+    const upstreamBody = injectMetadata(payload, {
+      model,
+      runId: lease.run.id,
+      sessionInstanceID,
+      traceSessionId: lease.run.traceSessionId,
+    });
 
     let up;
     try {
-      up = await client.chatCompletions(TOKEN, upstreamBody, { model, instanceId: sessionInstanceID, signal: controller.signal });
+      up = await client.chatCompletions(TOKEN, upstreamBody, { signal: controller.signal });
     } catch (e) {
       release(lease);
       if (gone()) return;
@@ -369,8 +554,10 @@ async function proxyChat(req, res, payload, model, format, stream) {
       try {
         if (format === 'claude') {
           await pipeClaude(res, up, model, stream, genId);
+        } else if (stream) {
+          await pipeThrough(res, up, genId, true);
         } else {
-          await pipeThrough(res, up, genId, stream);
+          await pipeOpenAISync(res, up, genId);
         }
       } catch (e) {
         logger.logErr(`${model} | response pipe failed: ${e.message}`);
@@ -433,15 +620,17 @@ function pipeClaude(res, upstream, model, stream, genId) {
     });
 
     if (!stream) {
-      readBody(upstream, 64 * 1024 * 1024)
-        .then(settle((body) => {
+      // The upstream is always SSE now (the CLI never sends sync chat), so
+      // accumulate it back into an OpenAI completion, then convert to Claude.
+      accumulateOpenAIStream(upstream)
+        .then(settle((openAIJSON) => {
           try {
             if (upstream.statusCode >= 400) {
-              writeUpstreamError('claude', res, upstream.statusCode, body);
+              writeUpstreamError('claude', res, upstream.statusCode, Buffer.from(openAIJSON));
               resolve();
               return;
             }
-            const converted = convertOpenAIResponseToClaude(body.toString());
+            const converted = convertOpenAIResponseToClaude(openAIJSON);
             res.writeHead(200, { ...CORS, 'Content-Type': 'application/json' });
             res.end(converted);
             resolve();
